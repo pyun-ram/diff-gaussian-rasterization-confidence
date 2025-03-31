@@ -13,6 +13,7 @@
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <stdio.h>
 namespace cg = cooperative_groups;
 
 // Forward method for converting the input spherical harmonics
@@ -258,7 +259,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, uint32_t CHANNELS_language_feature>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -266,13 +267,16 @@ renderCUDA(
 	int W, int H,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
+	const float* __restrict__ language_feature,
 	const float* __restrict__ depths,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ out_alpha,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
-	float* __restrict__ out_depth)
+	float* __restrict__ out_language_feature,
+	float* __restrict__ out_depth,
+	bool include_feature)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -303,6 +307,7 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+	float F[CHANNELS_language_feature] = { 0 };
 	float weight = 0;
 	float D = 0;
 
@@ -360,6 +365,11 @@ renderCUDA(
 			weight += alpha * T;
 			D += depths[collected_id[j]] * alpha * T;
 
+			if (include_feature)
+			{
+				for (int ch = 0; ch < CHANNELS_language_feature; ch++)
+					F[ch] += language_feature[collected_id[j] * CHANNELS_language_feature + ch] * alpha * T;
+			}
 			T = test_T;
 
 			// Keep track of last range entry to update this
@@ -375,6 +385,11 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		if (include_feature) 
+		{
+			for (int ch = 0; ch < CHANNELS_language_feature; ch++)
+				out_language_feature[ch * H * W + pix_id] = F[ch]; //bg_color ???
+		}
 		out_alpha[pix_id] = weight; //1 - T;
 		out_depth[pix_id] = D;
 	}
@@ -387,27 +402,33 @@ void FORWARD::render(
 	int W, int H,
 	const float2* means2D,
 	const float* colors,
+	const float* language_feature,
 	const float* depths,
 	const float4* conic_opacity,
 	float* out_alpha,
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
-	float* out_depth)
+	float* out_language_feature,
+	float* out_depth,
+	bool include_feature)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+	renderCUDA<NUM_CHANNELS, NUM_CHANNELS_language_feature> << <grid, block >> > (
 		ranges,
 		point_list,
 		W, H,
 		means2D,
 		colors,
+		language_feature,
 		depths,
 		conic_opacity,
 		out_alpha,
 		n_contrib,
 		bg_color,
 		out_color,
-		out_depth);
+		out_language_feature,
+		out_depth,
+		include_feature);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

@@ -412,7 +412,7 @@ __global__ void preprocessCUDA(
 }
 
 // Backward version of the rendering procedure.
-template <uint32_t C>
+template <uint32_t C, uint32_t F>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -422,18 +422,21 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
+	const float* __restrict__ language_feature,
 	const float* __restrict__ depths,
 	const float* __restrict__ alphas,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_dpixels_F,
 	const float* __restrict__ dL_dpixel_depths,
 	const float* __restrict__ dL_dalphas,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
-	float* __restrict__ dL_ddepths
-)
+	float* __restrict__ dL_dlanguage_feature,
+	float* __restrict__ dL_ddepths,
+	bool include_feature)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -456,6 +459,7 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
+	__shared__ float collected_feature[F * BLOCK_SIZE];
 	__shared__ float collected_depths[BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
@@ -485,6 +489,15 @@ renderCUDA(
 	float last_color[C] = { 0 };
 	float last_depth = 0;
 
+	float accum_rec_F[F] = {0};
+	float dL_dpixel_F[F] = {0};
+	float last_language_feature[F] = {0};
+
+	if (include_feature) {
+		if (inside)
+			for (int i = 0; i < F; i++)
+				dL_dpixel_F[i] = dL_dpixels_F[i * H * W + pix_id];
+	}
 	// Gradient of pixel coordinate w.r.t. normalized 
 	// screen-space viewport corrdinates (-1 to 1)
 	const float ddelx_dx = 0.5 * W;
@@ -505,6 +518,8 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			for (int i = 0; i < F; i++)
+				collected_feature[i * BLOCK_SIZE + block.thread_rank()] = language_feature[coll_id * F + i];
 			collected_depths[block.thread_rank()] = depths[coll_id];
 		}
 		block.sync();
@@ -554,7 +569,22 @@ renderCUDA(
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
-			
+			if (include_feature) {
+				for (int ch = 0; ch < F; ch++)
+				{
+					const float f = collected_feature[ch * BLOCK_SIZE + j];
+					// Update last color (to be used in the next iteration)
+					accum_rec_F[ch] = last_alpha * last_language_feature[ch] + (1.f - last_alpha) * accum_rec_F[ch];
+					last_language_feature[ch] = f;
+
+					const float dL_dchannel_F = dL_dpixel_F[ch];
+					dL_dalpha += (f - accum_rec_F[ch]) * dL_dchannel_F;
+					// Update the gradients w.r.t. color of the Gaussian. 
+					// Atomic, since this pixel is just one of potentially
+					// many that were affected by this Gaussian.
+					atomicAdd(&(dL_dlanguage_feature[global_id * F + ch]), dchannel_dcolor * dL_dchannel_F);
+				}
+			}
 			// Propagate gradients from pixel depth to opacity
 			const float c_d = collected_depths[j];
 			accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
@@ -677,19 +707,23 @@ void BACKWARD::render(
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
+	const float* language_feature,
 	const float* depths,
 	const float* alphas,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
+	const float* dL_dpixels_F,
 	const float* dL_dpixel_depths,
 	const float* dL_dalphas,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_ddepths)
+	float* dL_dlanguage_feature,
+	float* dL_ddepths,
+	bool include_feature)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	renderCUDA<NUM_CHANNELS, NUM_CHANNELS_language_feature> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
@@ -697,16 +731,19 @@ void BACKWARD::render(
 		means2D,
 		conic_opacity,
 		colors,
+		language_feature,
 		depths,
 		alphas,
 		n_contrib,
 		dL_dpixels,
+		dL_dpixels_F,
 		dL_dpixel_depths,
 		dL_dalphas,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
 		dL_dcolors,
-		dL_ddepths
-		);
+		dL_dlanguage_feature,
+		dL_ddepths,
+		include_feature);
 }
