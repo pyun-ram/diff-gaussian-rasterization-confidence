@@ -578,7 +578,7 @@ renderCUDA(
 					last_language_feature[ch] = f;
 
 					const float dL_dchannel_F = dL_dpixel_F[ch];
-					dL_dalpha += (f - accum_rec_F[ch]) * dL_dchannel_F;
+					dL_dopa += (f - accum_rec_F[ch]) * dL_dchannel_F;
 					// Update the gradients w.r.t. color of the Gaussian. 
 					// Atomic, since this pixel is just one of potentially
 					// many that were affected by this Gaussian.
